@@ -1,0 +1,6 @@
+---
+roles:
+  - name: common_linux_server
+    scm: git
+    src: 'git@github.com:NTT-DPA-Client-Connectivity/ansible-role-common-linux-server.git'
+    version: origin/main

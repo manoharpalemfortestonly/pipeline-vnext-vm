@@ -1,0 +1,8 @@
+---
+- name: AWX Nodes
+  hosts: linux_vm
+  roles:
+    - common_linux_server
+  vars:
+    # Update Packages
+    - include_updates: false

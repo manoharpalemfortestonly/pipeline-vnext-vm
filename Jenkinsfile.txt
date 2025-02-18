@@ -1,0 +1,181 @@
+def vault_config  = [
+    $class: 'VaultTokenCredentialBinding', 
+    credentialsId: 'vault_approle', 
+    vaultAddr: "${VAULT_ADDRESS}"
+]
+
+pipeline {
+    agent any
+    parameters {
+        choice(
+            name: 'Build Job',
+            choices: [
+                'awx_nodes'
+            ],
+            description: 'Choose Terraform job to run'
+        )
+        booleanParam(
+            name: 'Run Terraform?',
+            defaultValue: true,
+            description: ''
+        )
+        booleanParam(
+            name: 'Run Ansible?',
+            defaultValue: false,
+            description: ''
+        )
+    }
+    environment {
+        TF_VAR_GIT_BRANCH        = "${GIT_BRANCH}"
+        GITHUB_DEPLOY_TOKEN_USER = credentials('github_deploy_token_username')
+        GITHUB_DEPLOY_TOKEN_PASS = credentials('github_deploy_token_password')
+        GITHUB_DEPLOY_KEY        = credentials('github_deploy_key')
+        ARM_CLIENT_ID            = credentials('ARM_CLIENT_ID')
+        ARM_CLIENT_SECRET        = credentials('ARM_CLIENT_SECRET')
+    }
+    stages {
+        stage ('Set Build Details') {
+            steps{
+                script {
+                    currentBuild.displayName = "${params.'Build Job'}"
+                    currentBuild.description = "${params.'Build Job'}"
+                }
+            }
+        }
+        stage('Prepare Workspace Permissions') {
+            steps {
+                sh ''' chmod 600 ${WORKSPACE}/GIT/sshconfig '''
+                sh ''' sudo chown root:root ${WORKSPACE}/GIT/sshconfig ''' 
+            }
+        }
+        stage('Terraform'){
+            when {
+                expression { params.'Run Terraform?' == true }
+                beforeAgent true
+            }
+            agent {
+                docker {
+                    image 'hashicorp/terraform:1.4.6'
+                    reuseNode true //Prevents Jenkins from creating new Workspace directories for each stage
+                    args '-u=root --network host --entrypoint "" -v "$WORKSPACE/GIT/gitconfig:/root/.gitconfig" -v "$WORKSPACE/GIT/sshconfig:/root/.ssh/config" -v "\${GITHUB_DEPLOY_KEY}:/root/.ssh/github_id"'
+                }
+            }
+            stages {
+                stage("Terraform Plan") {
+                    steps {
+                        dir("./terraform/${params.'Build Job'}") {
+                        withCredentials([vault_config]){
+                            sh """ terraform init -upgrade -backend-config=\"key=vnext-vm/${GIT_BRANCH}/${params.'Build Job'}/terraform.tfstate\" """ + ''' -var="VAULT_TOKEN=${VAULT_TOKEN}" '''
+                            sh """ terraform validate """
+                            sh """ terraform plan -out=terraform_plan_azure.tfplan """ + ''' -var="VAULT_TOKEN=${VAULT_TOKEN}" '''
+                        }
+                        }
+                    }
+                }
+                stage("Terraform Apply") {
+                    input {
+                        message 'Review the Terraform Plan and confirm if you want to apply the changes in Azure'
+                        ok 'Yes, Apply'
+                    }
+                    steps {
+                        dir("./terraform/${params.'Build Job'}") {
+                        withCredentials([vault_config]){
+                            sh """ terraform init -backend-config=\"key=vnext-vm/${GIT_BRANCH}/${params.'Build Job'}/terraform.tfstate\" """ + ''' -var="VAULT_TOKEN=${VAULT_TOKEN}" '''
+                            sh """ terraform apply terraform_plan_azure.tfplan """
+                        }
+                        }
+                    }
+                }
+            }
+        }
+        stage('Ansible') {
+            when {
+                expression { params.'Run Ansible?' == true }
+                beforeAgent true
+            }
+            stages {
+                stage('Ansible Configuration') {
+                    parallel {
+                        stage("Terrform State Pull") {
+                            when { 
+                                allOf {
+                                    expression { params.'Run Ansible?' == true }
+                                }
+                                beforeAgent true 
+                            } 
+                            agent {
+                                docker { 
+                                    image 'hashicorp/terraform:1.4.6'
+                                    reuseNode true //Prevents Jenkins from creating new Workspace directories for each stage
+                                    args '-u=root --network host --entrypoint "" -v "$WORKSPACE/GIT/gitconfig:/root/.gitconfig" -v "$WORKSPACE/GIT/sshconfig:/root/.ssh/config" -v "\${GITHUB_DEPLOY_KEY}:/root/.ssh/github_id"'
+                                }
+                            }
+                            steps {
+                                dir("./terraform/${params.'Build Job'}") {
+                                withCredentials([vault_config]){
+                                    sh """ terraform init -upgrade -backend-config=\"key=vnext-vm/${GIT_BRANCH}/${params.'Build Job'}/terraform.tfstate\" """ + ''' -var="VAULT_TOKEN=${VAULT_TOKEN}" '''
+                                    sh """ terraform state pull > ../../ansible/${params.'Build Job'}/inventory/terraform.tfstate """ // For Ansible Inventory
+                                    sh """ terraform output -json > ../../ansible/${params.'Build Job'}/terraform_output_azure.json """ // For CMDB
+                                }
+                                }
+                            }
+                        }
+                        stage("Ansible Roles Update") {
+                            when {
+                                expression { params.'Run Ansible?' == true }
+                                beforeAgent true 
+                            }
+                            agent {
+                                docker { 
+                                    image 'platopstoolsacr.azurecr.io/docker-ansible-playbook:7.3.0'
+                                    registryUrl 'https://platopstoolsacr.azurecr.io'
+                                    registryCredentialsId  'platopstoolsacr.azurecr.io'
+                                    reuseNode true //Prevents Jenkins from creating new Workspace directories for each stage
+                                    args '-u=root --network host --entrypoint "" -v "$WORKSPACE/GIT/gitconfig:/root/.gitconfig" -v "$WORKSPACE/GIT/sshconfig:/root/.ssh/config" -v "\${GITHUB_DEPLOY_KEY}:/root/.ssh/github_id"'
+                                }
+                            }
+                            steps {
+                                dir("./ansible/${params.'Build Job'}") {
+                                    sh ''' ansible-galaxy role install --force -r requirements.yml --roles-path ./roles '''
+                                }
+                            }
+                        }
+                    }
+                }
+                stage("Playbook: Terraform Inventory"){
+                    when { 
+                        allOf {
+                            expression { params.'Run Ansible?' == true }
+                        }
+                        beforeAgent true 
+                    } 
+                    agent {
+                        docker { 
+                            image 'platopstoolsacr.azurecr.io/docker-ansible-playbook:7.3.0'
+                            registryUrl 'https://platopstoolsacr.azurecr.io'
+                            registryCredentialsId  'platopstoolsacr.azurecr.io'
+                            reuseNode true //Prevents Jenkins from creating new Workspace directories for each stage
+                            args '-u=root --network host --entrypoint "" -v "$WORKSPACE/ansible:/ansible/playbooks" -v "$WORKSPACE/GIT/gitconfig:/root/.gitconfig" -v "$WORKSPACE/GIT/sshconfig:/root/.ssh/config" -v "\${GITHUB_DEPLOY_KEY}:/root/.ssh/github_id"'
+                        }
+                    }
+                    environment {
+                        ANSIBLE_TF_DIR = "/ansible/playbooks/${params.'Build Job'}/inventory/"
+                    }
+                    steps {
+                        dir("./ansible/${params.'Build Job'}") {
+                        withCredentials([vault_config]){
+                            sh ''' ansible-galaxy collection install -r requirements.yml '''
+                            sh """ ansible-playbook -i ./inventory/terraform.py playbook.yml """ + ''' --extra-vars="VAULT_TOKEN=${VAULT_TOKEN}" '''
+                        }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    post {
+        always {
+            cleanWs deleteDirs: true, notFailBuild: true
+        }
+    }
+}
